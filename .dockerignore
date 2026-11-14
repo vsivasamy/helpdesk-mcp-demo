@@ -1,0 +1,11 @@
+.env
+.env.*
+.neon.env
+.venv/
+.local/
+__pycache__/
+tests/
+scripts/
+docs/
+.git/
+.github/
