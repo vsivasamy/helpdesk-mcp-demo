@@ -1,0 +1,1 @@
+"""Helpdesk MCP demo package."""
