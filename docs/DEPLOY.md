@@ -57,50 +57,64 @@ curl -s "https://ghcr.io/token?scope=repository:vsivasamy/helpdesk-mcp-demo:pull
 ```bash
 az login --use-device-code
 az account set --subscription "Pay-As-You-Go"
-az extension add --name containerapp --upgrade
+az extension add -n containerapp --upgrade
 
-# one-off per subscription (free; idempotent)
-az provider register --namespace Microsoft.App --wait
-az provider register --namespace Microsoft.OperationalInsights --wait
-
-LOC=southeastasia
-OWNER=vsivasamy
+# both providers were already Registered on this subscription, so register was not required
+az provider show -n Microsoft.App --query registrationState -o tsv
+az provider show -n Microsoft.OperationalInsights --query registrationState -o tsv
 ```
 
 🔒 **3a. Resource group** — created as `rg-mcp-demo` in `southeastasia`.
 ```bash
-az group create -n rg-mcp-demo -l $LOC --tags purpose=mcp-demo owner=vignesh
+az group create -n rg-mcp-demo -l southeastasia --tags project=mcp-demo
 ```
 
-🔒 **3b. Budget alert (₹100/month on the RG).** Created as `budget-mcp-demo`. It alerts by email but does **not** cap spend. The amount is in the **billing currency** (INR on this subscription).
+🔒 **3b. Budget alert (₹100/month on the RG, 1 Nov 2026 – 31 Dec 2027).** Created as `budget-mcp-demo` with `az rest` PUT to `Microsoft.Consumption/budgets` (api-version `2023-05-01`). It alerts by email but does **not** cap spend. The amount is in the **billing currency** (INR on this subscription). Alerts: actual 50%, actual 100%, forecast 100%.
 ```bash
-# Example of the notifications payload; use the Budgets REST API or Cost Management in the portal
-# if `az consumption budget` is unavailable. Alerts at 50% and 100% actual, and 100% forecast.
-az consumption budget create-with-rg -g rg-mcp-demo -n budget-mcp-demo \
-  --amount 100 --category Cost --time-grain Monthly \
-  --time-period start-date=2026-11-01 end-date=2027-11-01 \
-  --notifications @/tmp/budget-notifications.json
+# budget.json (redact the subscription id and contact email; never commit this file)
+cat > budget.json <<'JSON'
+{
+  "properties": {
+    "category": "Cost",
+    "amount": 100,
+    "timeGrain": "Monthly",
+    "timePeriod": { "startDate": "2026-11-01T00:00:00Z", "endDate": "2027-12-31T00:00:00Z" },
+    "notifications": {
+      "actual50":    { "enabled": true, "operator": "GreaterThan", "threshold": 50,  "thresholdType": "Actual",     "contactEmails": ["<owner-email>"] },
+      "actual100":   { "enabled": true, "operator": "GreaterThan", "threshold": 100, "thresholdType": "Actual",     "contactEmails": ["<owner-email>"] },
+      "forecast100": { "enabled": true, "operator": "GreaterThan", "threshold": 100, "thresholdType": "Forecasted", "contactEmails": ["<owner-email>"] }
+    }
+  }
+}
+JSON
+az rest --method put \
+  --url "https://management.azure.com/subscriptions/<subscription-id>/resourceGroups/rg-mcp-demo/providers/Microsoft.Consumption/budgets/budget-mcp-demo?api-version=2023-05-01" \
+  --body @budget.json
 ```
-Portal alternative: Cost Management → Budgets → + Add → scope `rg-mcp-demo` → Monthly, amount 100 → alert conditions 50/100 % actual and 100 % forecast → email.
+Portal alternative: Cost Management → Budgets → + Add → scope `rg-mcp-demo` → Monthly, amount 100, period ending 31 Dec 2027 → alert conditions 50/100 % actual and 100 % forecast → email.
 
 🔒 **3c. Container Apps environment.** Created as `cae-mcp-demo`. Consumption-only, **no Log Analytics** (avoids ingestion charges).
 ```bash
-az containerapp env create -n cae-mcp-demo -g rg-mcp-demo -l $LOC \
-  --logs-destination none
+az containerapp env create -n cae-mcp-demo -g rg-mcp-demo -l southeastasia --logs-destination none
 # don't add dedicated workload profiles, private endpoints or planned maintenance (those carry a $0.10/h management fee)
 ```
 
-🔒 **3d. Container app** — created as `helpdesk-mcp`. Public GHCR image, so no registry credentials; scale to zero; `DATABASE_URL` stored as secret `database-url`; `ENABLE_WRITES=false`.
+🔒 **3d. Container app** — created as `helpdesk-mcp`. Public GHCR image, so no registry credentials; scale to zero; `DATABASE_URL` stored as secret `database-url`; `ENABLE_WRITES=false`. No `--transport` flag was passed (the default is `auto`). No HTTP scale rule was set.
 ```bash
-NEON_RO_URL='<paste from .neon.env - never commit>'
-az containerapp create -n helpdesk-mcp -g rg-mcp-demo --environment cae-mcp-demo \
-  --image ghcr.io/$OWNER/helpdesk-mcp-demo:latest \
-  --ingress external --target-port 8000 --transport auto \
-  --min-replicas 0 --max-replicas 1 \
+# Do not `source` .neon.env: an unquoted '&' in the URL truncates it and Azure
+# returns ContainerAppSecretInvalid. Parse the file instead (scripts/with_env.py
+# does the same). Always quote URLs that contain '&'.
+NEON_RO_URL=$(.venv/bin/python -c "from pathlib import Path; print(dict(l.split('=',1) for l in Path('.neon.env').read_text().splitlines() if l and not l.startswith('#') and '=' in l)['NEON_RO_URL'])")
+az containerapp create -g rg-mcp-demo -n helpdesk-mcp \
+  --environment cae-mcp-demo \
+  --image ghcr.io/vsivasamy/helpdesk-mcp-demo:latest \
+  --ingress external --target-port 8000 \
   --cpu 0.25 --memory 0.5Gi \
-  --scale-rule-name http-rule --scale-rule-type http --scale-rule-http-concurrency 20 \
-  --secrets database-url="$NEON_RO_URL" \
-  --env-vars DATABASE_URL=secretref:database-url ENABLE_WRITES=false ALLOWED_HOSTS='*.azurecontainerapps.io' STATEMENT_TIMEOUT_MS=5000
+  --min-replicas 0 --max-replicas 1 \
+  --secrets "database-url=$NEON_RO_URL" \
+  --env-vars DATABASE_URL=secretref:database-url ENABLE_WRITES=false HOST=0.0.0.0 PORT=8000 \
+             "ALLOWED_HOSTS=*.azurecontainerapps.io" STATEMENT_TIMEOUT_MS=5000 \
+  --tags project=mcp-demo
 unset NEON_RO_URL
 
 FQDN=$(az containerapp show -n helpdesk-mcp -g rg-mcp-demo --query properties.configuration.ingress.fqdn -o tsv)
